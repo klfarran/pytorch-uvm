@@ -1,3 +1,4 @@
+//edited file
 #include <c10/cuda/CUDACachingAllocator.h>
 
 #include <c10/core/impl/GPUTrace.h>
@@ -1206,7 +1207,7 @@ cudaError_t allocPrimitive(void** ptr, size_t size, AllocParams& p) {
     
     if(use_uvm) {
       //debug
-      printf("[UVM] Allocating %zu bytes\n", size);
+      //printf("[UVM] Allocating %zu bytes\n", size);
       cudaError_t err = cudaMallocManaged(ptr, size);
       if(err = cudaSuccess) {
         int device;
@@ -4163,7 +4164,7 @@ static void* uncached_allocate(size_t size) {
   static bool use_uvm = (getenv("PYTORCH_CUDA_UVM") != nullptr);
   if(use_uvm) {
     //debug 
-    printf("[UVM] Allocating %zu bytes\n", size);
+    //printf("[UVM] Allocating %zu bytes\n", size);
     C10_CUDA_CHECK(cudaMallocManaged(&devPtr, size));
     int device;
     cudaGetDevice(&device);
