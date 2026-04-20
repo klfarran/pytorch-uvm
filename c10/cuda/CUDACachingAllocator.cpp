@@ -52,6 +52,12 @@
 TORCH_SDT_DEFINE_SEMAPHORE(malloc)
 TORCH_SDT_DEFINE_SEMAPHORE(free)
 
+// ==== UVM FLAGS ====
+static bool USE_UVM = (getenv("PYTORCH_CUDA_UVM") != nullptr);
+static bool UVM_SPLIT   = getenv("PYTORCH_UVM_SPLIT")   != nullptr;
+static bool UVM_PERSIST = getenv("PYTORCH_UVM_PERSIST") != nullptr;
+static bool UVM_PREFETCH= getenv("PYTORCH_UVM_PREFETCH")!= nullptr;
+
 // add these definitions so that we can compile with CUDA < 12.3
 // borrowed from
 // https://github.com/NVIDIA/nccl/blob/3ea7eedf3b9b94f1d9f99f4e55536dfcbd23c1ca/src/include/p2p.h#L20
@@ -1203,13 +1209,12 @@ cudaError_t allocPrimitive(void** ptr, size_t size, AllocParams& p) {
     return *ptr ? cudaSuccess : cudaErrorMemoryAllocation;
   } else {
     //return C10_CUDA_ERROR_HANDLED(cudaMalloc(ptr, size));
-    static bool use_uvm = (getenv("PYTORCH_CUDA_UVM") != nullptr);
-    
-    if(use_uvm) {
+     
+    if(USE_UVM) {
       //debug
       //printf("[UVM] Allocating %zu bytes\n", size);
       cudaError_t err = cudaMallocManaged(ptr, size);
-      if(err = cudaSuccess) {
+      if(err == cudaSuccess) {
         int device;
         cudaGetDevice(&device);
         cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, device);
@@ -3133,8 +3138,18 @@ class DeviceCachingAllocator {
     TORCH_INTERNAL_ASSERT(
         !to_map->context_when_allocated); // unmapped blocks should not keep
                                           // history
+    size_t map_size = size;
+
+    if (UVM_SPLIT) {
+      constexpr size_t kUVMPage = 65536;
+      map_size = (size + kUVMPage - 1) & ~(kUVMPage - 1);
+      map_size = std::min(map_size, to_map->size);
+      printf("[MAP_BLOCK] size=%zu map_size=%zu\n", size, map_size);
+    }
+
     auto mapped_range =
-        to_map->expandable_segment_->map(SegmentRange{to_map->ptr, size});
+        to_map->expandable_segment_->map(SegmentRange{to_map->ptr, map_size});
+        
     // failed to map the memory
     if (mapped_range.size == 0) {
       return false;
@@ -3378,11 +3393,22 @@ class DeviceCachingAllocator {
       const Block* block,
       size_t size,
       bool is_expandable_segments_active) {
+
     // If the pool is marked as not splitting a segment, do not split
     if (no_split_pools.find(block->pool->owner_MempoolId()) !=
         no_split_pools.end()) {
       return false;
     }
+
+    if (UVM_SPLIT) {
+      constexpr size_t kUVMPage = 65536;
+
+      // round up allocation to page boundary
+      size_t aligned = (size + kUVMPage - 1) & ~(kUVMPage - 1);
+
+      return (block->size - aligned) >= kUVMPage;
+    }
+
     // Otherwise, check if the remaining size is greater than the minimum block
     // size
     size_t remaining = block->size - size;
@@ -3461,6 +3487,15 @@ class DeviceCachingAllocator {
       return false;
     p.block = *it;
     pool.blocks.erase(it);
+
+    //UVM- prefetch back to gpu on reuse
+    if (USE_UVM) {
+    int device = p.device();
+    cudaMemAdvise(p.block->ptr, p.block->size,
+                  cudaMemAdviseSetPreferredLocation, device);
+    cudaMemPrefetchAsync(p.block->ptr, p.block->size, device, p.stream());
+  }
+
     return true;
   }
 
@@ -3612,10 +3647,37 @@ class DeviceCachingAllocator {
         // any potential exceptions in the cudaMallocMaybeCapturing function.
         auto sg = c10::make_scope_exit([&]() { lock.lock(); });
         lock.unlock();
-        p.err = cudaMallocMaybeCapturing(&ptr, size, p);
+
+       if (USE_UVM) {
+        p.err = cudaMallocManaged(&ptr, size);
+
+        if (p.err == cudaSuccess) {
+          int device;
+          cudaGetDevice(&device);
+
+          cudaMemAdvise(ptr, size, cudaMemAdviseSetPreferredLocation, device);
+          cudaMemAdvise(ptr, size, cudaMemAdviseSetAccessedBy, device);
+        }
       } else {
         p.err = cudaMallocMaybeCapturing(&ptr, size, p);
       }
+
+    } else {
+      if (USE_UVM) {
+        p.err = cudaMallocManaged(&ptr, size);
+
+        if (p.err == cudaSuccess) {
+          int device;
+          cudaGetDevice(&device);
+
+          cudaMemAdvise(ptr, size, cudaMemAdviseSetPreferredLocation, device);
+          cudaMemAdvise(ptr, size, cudaMemAdviseSetAccessedBy, device);
+        }
+      } else {
+        p.err = cudaMallocMaybeCapturing(&ptr, size, p);
+      }
+    }
+       
       if (CUDAAllocatorConfig::release_lock_on_cudamalloc()) {
         TORCH_CHECK(
             lock.owns_lock(), "Failed to acquire lock after cudaMalloc");
@@ -3812,7 +3874,11 @@ class DeviceCachingAllocator {
         context ? context : block->context_when_segment_allocated);
 
     auto* pool = block->pool;
-    if (pool->owner_PrivatePool && pool->owner_PrivatePool->allocator()) {
+    if(USE_UVM && UVM_PERSIST) {
+      cudaMemAdvise(block->ptr, block->size,
+                  cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+      cudaMemPrefetchAsync(block->ptr, block->size, cudaCpuDeviceId, 0);
+    } else if (pool->owner_PrivatePool && pool->owner_PrivatePool->allocator()) {
       // If there is an active mempool with a given allocator,
       // we use the given allocator's delete function.
       pool->owner_PrivatePool->allocator()->raw_delete(block->ptr);
@@ -4161,8 +4227,7 @@ static void* uncached_allocate(size_t size) {
   // if someone tries to use forceUncachedAllocator while capturing.
   //C10_CUDA_CHECK(cudaMalloc(&devPtr, size));
 
-  static bool use_uvm = (getenv("PYTORCH_CUDA_UVM") != nullptr);
-  if(use_uvm) {
+  if(USE_UVM) {
     //debug 
     //printf("[UVM] Allocating %zu bytes\n", size);
     C10_CUDA_CHECK(cudaMallocManaged(&devPtr, size));
@@ -4170,6 +4235,10 @@ static void* uncached_allocate(size_t size) {
     cudaGetDevice(&device);
     cudaMemAdvise(devPtr, size, cudaMemAdviseSetPreferredLocation, device);
     cudaMemAdvise(devPtr, size, cudaMemAdviseSetAccessedBy, device);
+
+    if(UVM_PREFETCH) {
+      cudaMemPrefetchAsync(devPtr, size, device, 0);
+    }
   } else {
     C10_CUDA_CHECK(cudaMalloc(&devPtr, size));
   }
